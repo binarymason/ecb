@@ -2,6 +2,7 @@ import hashlib
 import tempfile
 import pyzipper as pyz
 import boto3
+from botocore.errorfactory import ClientError
 from pathlib import Path
 
 def fingerprint(file_path):
@@ -45,7 +46,7 @@ def encrypted_backup(dir_path, password, bucket="my_bucket", base_path=None, **k
 
   if base_path is None:
     base_path = Path(dir_path.name)
-    log_step("backing up:", base_path)
+    log_title("backing up: {}".format(base_path))
   else:
     base_path = base_path / dir_path.name
 
@@ -55,10 +56,15 @@ def encrypted_backup(dir_path, password, bucket="my_bucket", base_path=None, **k
   if len(files) == 0:
     return
 
+  fingerprint = combined_fingerprint(files)
+  fname = fingerprint + ".zip"
+  key = str(Path(base_path)/fname)
+  if s3_object_exists(bucket, key):
+    log_step(dir_path, "\t OK")
+    return
+
+
   with tempfile.TemporaryDirectory() as tmp_dir:
-    fingerprint = combined_fingerprint(files)
-    fname = fingerprint + ".zip"
-    key = str(Path(base_path)/fname)
     z = encrypted_zip(files, Path(tmp_dir)/fname, password)
     log_step(dir_path, "\t-> {}/{}".format(bucket, key))
     backup(z, bucket, key, **kwargs)
@@ -84,8 +90,42 @@ def backup(src_path, bucket, key, backup_type="s3"):
     local_backup(src_path, bucket, key)
 
 def s3_backup(src_path, bucket, key):
+  path = Path(key)
+  folder = str(path.parent)
+  fname = path.name
+
+  # Don't do anything if fingerprinted zip already uploaded
+  if s3_object_exists(bucket, key):
+      return
+
+  # Remove outdated zips
+  for x in get_matching_s3_keys(bucket, prefix=folder):
+    x = Path(x)
+
+    if str(x.parent) == str(folder) and x.name != fname:
+      s3_delete_file(bucket, key)
+
+
+  # Upload latest zip.
+  s3_upload(src_path, bucket, key)
+
+def s3_delete_file(bucket, key):
+  s3 = boto3.resource('s3')
+  s3.Object(bucket, key).delete()
+
+def s3_upload(src_path, bucket, key):
+  src_path = str(src_path)
   s3_client = boto3.client('s3')
-  s3_client.upload_file(str(src_path), bucket, key)
+  s3_client.upload_file(src_path, bucket, key)
+
+def s3_object_exists(bucket, key):
+  s3 = boto3.client('s3')
+  try:
+    s3.head_object(Bucket=bucket, Key=key)
+    return True
+  except ClientError:
+    # Not found
+    return False
 
 def local_backup(src_path, bucket, key):
   """useful for testing"""
@@ -94,9 +134,62 @@ def local_backup(src_path, bucket, key):
   path.parent.mkdir(parents=True, exist_ok=True)
   shutil.copy(src_path, path)
 
-def log_step(*args):
-  print("+ ", *args)
+def log_title(*args):
+  print("=>", *args)
 
+def log_step(*args):
+  args = [str(a) for a in args]
+  print("+ {: <40} {: >40}".format(*args))
+
+# --- kudos to https://alexwlchan.net/2019/07/listing-s3-keys/
+
+def get_matching_s3_objects(bucket, prefix="", suffix=""):
+  """
+  Generate objects in an S3 bucket.
+
+  :param bucket: Name of the S3 bucket.
+  :param prefix: Only fetch objects whose key starts with
+      this prefix (optional).
+  :param suffix: Only fetch objects whose keys end with
+      this suffix (optional).
+  """
+  s3 = boto3.client("s3")
+  paginator = s3.get_paginator("list_objects_v2")
+
+  kwargs = {'Bucket': bucket}
+
+  # We can pass the prefix directly to the S3 API.  If the user has passed
+  # a tuple or list of prefixes, we go through them one by one.
+  if isinstance(prefix, str):
+    prefixes = (prefix, )
+  else:
+    prefixes = prefix
+
+  for key_prefix in prefixes:
+    kwargs["Prefix"] = key_prefix
+
+    for page in paginator.paginate(**kwargs):
+      try:
+        contents = page["Contents"]
+      except KeyError:
+        break
+
+      for obj in contents:
+        key = obj["Key"]
+        if key.endswith(suffix):
+          yield obj
+
+
+def get_matching_s3_keys(bucket, prefix="", suffix=""):
+  """
+  Generate the keys in an S3 bucket.
+
+  :param bucket: Name of the S3 bucket.
+  :param prefix: Only fetch keys that start with this prefix (optional).
+  :param suffix: Only fetch keys that end with this suffix (optional).
+  """
+  for obj in get_matching_s3_objects(bucket, prefix, suffix):
+    yield obj["Key"]
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='encrypt and backup your files to the cloud')
